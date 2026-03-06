@@ -1,8 +1,7 @@
 # 🛡️ Detection Log Quality Analyser
 
 A professional SOC/Detection Engineering tool to assess log quality, 
-field coverage, MITRE use-case matching, duplicate detection, and 
-Splunk storage sizing.
+field coverage, MITRE use-case matching, duplicate detection.
 
 ## Features
 - Non-Printable Character Detection
