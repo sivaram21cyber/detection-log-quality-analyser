@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detection Log Quality Analyser</title>
+    <script src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #030712; color: #f3f4f6; font-family: 'Inter', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #111827; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #374151; border-radius: 10px; }
+        .animate-fade-in { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useCallback, useRef } = React;
+
+        // PRE-LOADED USE CASES
+        const DEFAULT_USE_CASES = [
+          { Usecase_ID: 'UC001', Usecase_Name: 'Brute Force Login', Required_Fields: 'username,result,source_ip,timestamp', Keywords: 'failed,login', MITRE_Technique: 'T1110', Description: 'Detect multiple failed login attempts' },
+          { Usecase_ID: 'UC002', Usecase_Name: 'Successful Login After Failures', Required_Fields: 'username,result,source_ip,timestamp', Keywords: 'success,login', MITRE_Technique: 'T1078', Description: 'Possible account compromise' },
+          { Usecase_ID: 'UC003', Usecase_Name: 'Suspicious PowerShell Execution', Required_Fields: 'hostname,process_name,username,timestamp', Keywords: 'powershell', MITRE_Technique: 'T1059', Description: 'PowerShell execution detection' },
+          { Usecase_ID: 'UC004', Usecase_Name: 'External Network Connection', Required_Fields: 'source_ip,destination_ip,action,timestamp', Keywords: 'connect,allow', MITRE_Technique: 'T1071', Description: 'Possible command and control traffic' },
+          { Usecase_ID: 'UC005', Usecase_Name: 'Suspicious Process Execution', Required_Fields: 'hostname,process_name,username,timestamp', Keywords: 'cmd.exe,powershell', MITRE_Technique: 'T1059', Description: 'Suspicious command execution' },
+          { Usecase_ID: 'UC006', Usecase_Name: 'Data Exfiltration', Required_Fields: 'source_ip,destination_ip,bytes_out,timestamp', Keywords: 'upload,transfer', MITRE_Technique: 'T1041', Description: 'Large data transfer outside network' }
+        ];
+
+        const REQUIRED_FIELDS = {
+          Authentication: ['timestamp','username','source_ip','result','logon_type'],
+          Firewall:       ['timestamp','src_ip','dst_ip','dst_port','action','protocol'],
+          Proxy:          ['timestamp','src_ip','url','method','status_code','bytes'],
+          Endpoint:       ['timestamp','hostname','process_name','action','user'],
+        };
+
+        const GB = 1024 * 1024 * 1024;
+        const AVG_EVENT_BYTES = 500;
+
+        const Gauge = ({ value }) => {
+          const pct = value / 100;
+          const angle = -135 + pct * 270;
+          const color = value >= 80 ? '#10b981' : value >= 60 ? '#f59e0b' : '#ef4444';
+          return (
+            <svg viewBox="0 0 200 130" className="w-48 h-32 mx-auto">
+              <path d="M20 110 A80 80 0 1 1 180 110" fill="none" stroke="#1f2937" strokeWidth="18" strokeLinecap="round"/>
+              <path d="M20 110 A80 80 0 1 1 180 110" fill="none" stroke={color} strokeWidth="18" strokeLinecap="round"
+                strokeDasharray={`${pct*251.2} 251.2`}/>
+              <g transform={`rotate(${angle},100,110)`}>
+                <line x1="100" y1="110" x2="100" y2="42" stroke="white" strokeWidth="3" strokeLinecap="round"/>
+                <circle cx="100" cy="110" r="6" fill="white"/>
+              </g>
+              <text x="100" y="125" textAnchor="middle" fill={color} fontSize="22" fontWeight="bold">{value}</text>
+            </svg>
+          );
+        };
+
+        const App = () => {
+          const [page, setPage] = useState('input');
+          const [tab, setTab] = useState('overview');
+          const [logText, setLogText] = useState('');
+          const [logType, setLogType] = useState('Authentication');
+          const [useCases, setUseCases] = useState(DEFAULT_USE_CASES);
+          const [eps, setEps] = useState('');
+          const [results, setResults] = useState(null);
+          const fileRef = useRef();
+
+          const storageCalc = (epsVal) => {
+            const e = parseFloat(epsVal) || 0;
+            const eventsPerDay = e * 86400;
+            const dailyBytes = eventsPerDay * AVG_EVENT_BYTES;
+            const dailyGB = dailyBytes / GB;
+            const yearlyGB = dailyGB * 365;
+            const splunkLimit = 10;
+            const pct = Math.min((dailyGB / splunkLimit) * 100, 100);
+            const exceeded = dailyGB > splunkLimit;
+            return { eventsPerDay, dailyGB, yearlyGB, pct, exceeded, splunkLimit };
+          };
+
+          const analyse = () => {
+            const lines = logText.trim().split('\n').filter(Boolean);
+            if (!lines.length) return alert('Please paste or upload log data first.');
+
+            // Detect non-printable: ASCII control chars, Unicode replacement char (U+FFFD),
+            // Unicode private use area, zero-width chars, and other invisible Unicode
+            const hasNonPrintable = (str) => {
+              // ASCII control characters (excluding tab \x09, newline \x0A, carriage return \x0D)
+              if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(str)) return true;
+              // Unicode replacement character (???)
+              if (/\uFFFD/.test(str)) return true;
+              // Zero-width characters
+              if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/.test(str)) return true;
+              // Unicode private use area
+              if (/[\uE000-\uF8FF]/.test(str)) return true;
+              // Other non-printable Unicode categories (Cc, Cf)
+              if (/[\u0080-\u009F]/.test(str)) return true;
+              return false;
+            };
+            const npLines = lines.filter(l => hasNonPrintable(l));
+            const nonPrintablePct = (npLines.length / lines.length) * 100;
+
+            const required = REQUIRED_FIELDS[logType] || [];
+            let fieldHits = 0;
+            lines.forEach(l => {
+              const present = required.filter(f => l.toLowerCase().includes(f.toLowerCase()));
+              fieldHits += present.length / required.length;
+            });
+            const fieldScore = required.length ? (fieldHits / lines.length) * 100 : 100;
+
+            let detHits = 0;
+            lines.forEach(l => {
+              const ll = l.toLowerCase();
+              const matched = useCases.some(uc => {
+                const kws = (uc.Keywords || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+                return kws.some(k => ll.includes(k));
+              });
+              if (matched) detHits++;
+            });
+            const detectionScore = (detHits / lines.length) * 100;
+
+            const seen = {}; const dups = [];
+            lines.forEach(l => { seen[l] = (seen[l] || 0) + 1; });
+            Object.entries(seen).forEach(([l, c]) => { if (c > 1) dups.push({ log: l, count: c }); });
+            const duplicatePct = (dups.reduce((a, d) => a + d.count - 1, 0) / lines.length) * 100;
+
+            const fieldDetail = {};
+            required.forEach(f => {
+              const cnt = lines.filter(l => l.toLowerCase().includes(f.toLowerCase())).length;
+              fieldDetail[f] = Math.round((cnt / lines.length) * 100);
+            });
+
+            const ucMatches = useCases.map(uc => {
+              const kws = (uc.Keywords || '').split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+              const matched = lines.filter(l => {
+                const ll = l.toLowerCase();
+                return kws.some(k => ll.includes(k));
+              }).length;
+              return { ...uc, matched, pct: Math.round((matched / lines.length) * 100) };
+            });
+
+            setResults({
+              lines, nonPrintablePct, fieldScore, detectionScore, duplicatePct,
+              dups, fieldDetail, ucMatches, required,
+            });
+            setPage('dashboard');
+            setTab('overview');
+          };
+
+          const score = results ? (() => {
+            // Deduct 2 points per 1% non-printable (so 10% = 0 score), minimum 0
+            const s1 = Math.max(0, Math.round(20 - (results.nonPrintablePct * 2)));
+            const s2 = Math.round((results.fieldScore / 100) * 20);
+            const s3 = Math.round((results.detectionScore / 100) * 20);
+            const s4 = Math.max(0, 20 - Math.round(results.duplicatePct / 5));
+            const s5 = 20;
+            return { s1, s2, s3, s4, s5, total: s1+s2+s3+s4+s5 };
+          })() : null;
+
+          const sc = storageCalc(eps);
+
+          if (page === 'input') return (
+            <div className="min-h-screen p-8 flex flex-col items-center">
+              <div className="max-w-4xl w-full space-y-8">
+                <div className="text-center">
+                  <h1 className="text-4xl font-extrabold text-blue-400 tracking-tight">🛡️ Detection Log Quality Analyser</h1>
+                  <p className="mt-2 text-gray-400">Professional Detection Engineering Log Assessment & Storage Sizing</p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 shadow-xl">
+                    <h2 className="text-xl font-bold text-blue-300 mb-4 flex items-center gap-2">📋 Log Data</h2>
+                    <select value={logType} onChange={e => setLogType(e.target.value)}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2 mb-4 focus:ring-2 focus:ring-blue-500 outline-none">
+                      {Object.keys(REQUIRED_FIELDS).map(t => <option key={t}>{t}</option>)}
+                    </select>
+                    <textarea value={logText} onChange={e => setLogText(e.target.value)}
+                      placeholder="Paste logs here..."
+                      className="w-full h-64 bg-gray-800 border border-gray-700 rounded-xl p-4 text-sm font-mono focus:ring-2 focus:ring-blue-500 outline-none resize-none custom-scrollbar"/>
+                    <button onClick={() => fileRef.current.click()}
+                      className="mt-4 w-full py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-semibold transition-all border border-gray-700">📁 Upload Log File</button>
+                    <input ref={fileRef} type="file" className="hidden" onChange={e => {
+                      const f=e.target.files[0]; if(f){const r=new FileReader();r.onload=ev=>setLogText(ev.target.result);r.readAsText(f);}
+                    }}/>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 shadow-xl">
+                      <h2 className="text-xl font-bold text-blue-300 mb-4 flex items-center gap-2">🎯 Detection Rules</h2>
+                      <div className="p-4 bg-gray-800 rounded-xl border border-gray-700">
+                        <p className="text-xs text-gray-400 mb-2 uppercase font-bold">Pre-loaded Use Cases</p>
+                        <ul className="text-xs space-y-1 text-blue-400">
+                          {useCases.map(uc => <li key={uc.Usecase_ID}>• {uc.Usecase_Name} ({uc.MITRE_Technique})</li>)}
+                        </ul>
+                      </div>
+                      <p className="text-[10px] text-gray-500 mt-2 italic text-center">Rules are automatically applied during analysis.</p>
+                    </div>
+
+                    <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 shadow-xl">
+                      <h2 className="text-xl font-bold text-blue-300 mb-4 flex items-center gap-2">📊 Volume (EPS)</h2>
+                      <input type="number" value={eps} onChange={e => setEps(e.target.value)} placeholder="Enter Manual EPS..."
+                        className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 outline-none text-lg font-bold"/>
+                      {eps && (
+                        <div className="mt-4 p-4 bg-gray-800 rounded-xl border border-gray-700">
+                          <div className="flex justify-between text-xs text-gray-400 mb-2">
+                            <span>Splunk 10GB Dev Limit</span>
+                            <span className={sc.exceeded ? 'text-red-400 font-bold' : 'text-green-400 font-bold'}>{sc.dailyGB.toFixed(2)} / 10 GB</span>
+                          </div>
+                          <div className="w-full bg-gray-700 rounded-full h-2">
+                            <div className={`h-2 rounded-full transition-all ${sc.exceeded ? 'bg-red-500' : 'bg-green-500'}`} style={{width:`${sc.pct}%`}}/>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <button onClick={analyse}
+                  className="w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-2xl font-bold text-xl shadow-lg transform transition-all active:scale-95">
+                  🚀 Run Quality Analysis
+                </button>
+              </div>
+            </div>
+          );
+
+          return (
+            <div className="min-h-screen flex flex-col">
+              <header className="bg-gray-900 border-b border-gray-800 px-8 py-4 flex justify-between items-center sticky top-0 z-10">
+                <div className="flex items-center gap-4">
+                  <span className="text-2xl font-black text-blue-400">🛡️ DLQA</span>
+                  <div className="h-6 w-px bg-gray-700"/>
+                  <span className="text-sm font-medium text-gray-400 uppercase tracking-widest">{logType}</span>
+                </div>
+                <button onClick={() => setPage('input')} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm font-bold border border-gray-700 transition-all">← NEW SESSION</button>
+              </header>
+
+              <nav className="bg-gray-900 border-b border-gray-800 px-8 flex gap-8">
+                {['overview','fields','detection','duplicates','storage','report'].map(t => (
+                  <button key={t} onClick={() => setTab(t)}
+                    className={`py-4 text-sm font-bold uppercase tracking-tighter border-b-2 transition-all ${tab===t ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-500 hover:text-gray-300'}`}>
+                    {t}
+                  </button>
+                ))}
+              </nav>
+
+              <main className="p-8 max-w-6xl mx-auto w-full flex-1">
+                {tab === 'overview' && (
+                  <div className="space-y-8 animate-fade-in">
+                    <div className={`p-10 rounded-3xl border-2 text-center shadow-2xl ${score.total >= 80 ? 'bg-green-900 bg-opacity-10 border-green-500' : score.total >= 60 ? 'bg-yellow-900 bg-opacity-10 border-yellow-500' : 'bg-red-900 bg-opacity-10 border-red-500'}`}>
+                      <h3 className="text-gray-400 font-bold uppercase tracking-widest mb-4">Quality Score</h3>
+                      <Gauge value={score.total}/>
+                      <p className="text-7xl font-black mt-4 tracking-tighter">{score.total}<span className="text-3xl text-gray-500">/100</span></p>
+                      <p className={`text-xl font-bold mt-2 uppercase ${score.total >= 80 ? 'text-green-400' : score.total >= 60 ? 'text-yellow-400' : 'text-red-400'}`}>
+                        {score.total >= 80 ? 'Grade: A - Production Ready' : score.total >= 60 ? 'Grade: B - Needs Tuning' : 'Grade: F - Poor Quality'}
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-4">
+                      {[
+                        { label: 'Non-Printable Characters', s: score.s1, d: `${results.nonPrintablePct.toFixed(1)}% found` },
+                        { label: 'Crucial Field Coverage', s: score.s2, d: `${results.fieldScore.toFixed(1)}% coverage` },
+                        { label: 'Detection Use-Case Match', s: score.s3, d: `${results.detectionScore.toFixed(1)}% match rate` },
+                        { label: 'Duplicate Log Detection', s: score.s4, d: `${results.duplicatePct.toFixed(1)}% redundancy` },
+                        { label: 'Log Volume Analysis', s: score.s5, d: 'Manual EPS provided' }
+                      ].map((item, i) => (
+                        <div key={i} className="bg-gray-900 p-5 rounded-2xl border border-gray-800 flex items-center gap-6">
+                          <div className="w-16 text-center">
+                            <span className="text-2xl font-black text-blue-400">{item.s}</span>
+                            <p className="text-[10px] text-gray-500 font-bold">/20</p>
+                          </div>
+                          <div className="flex-1">
+                            <p className="font-bold text-gray-200">{item.label}</p>
+                            <p className="text-xs text-gray-500 mb-2">{item.d}</p>
+                            <div className="w-full bg-gray-800 rounded-full h-1.5">
+                              <div className="h-1.5 rounded-full bg-blue-500" style={{width:`${(item.s/20)*100}%`}}/>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {tab === 'fields' && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {Object.entries(results.fieldDetail).map(([f, p]) => (
+                      <div key={f} className="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                        <div className="flex justify-between items-end mb-3">
+                          <span className="text-lg font-mono font-bold text-blue-300">{f}</span>
+                          <span className="text-2xl font-black">{p}%</span>
+                        </div>
+                        <div className="w-full bg-gray-800 rounded-full h-3">
+                          <div className={`h-3 rounded-full ${p >= 80 ? 'bg-green-500' : 'bg-red-500'}`} style={{width:`${p}%`}}/>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {tab === 'detection' && (
+                  <div className="space-y-4">
+                    {results.ucMatches.map(uc => (
+                      <div key={uc.Usecase_ID} className="bg-gray-900 p-6 rounded-2xl border border-gray-800 flex justify-between items-center">
+                        <div>
+                          <p className="text-xs text-blue-400 font-bold">{uc.Usecase_ID} • {uc.MITRE_Technique}</p>
+                          <h4 className="text-lg font-bold text-gray-200">{uc.Usecase_Name}</h4>
+                          <p className="text-xs text-gray-500 mt-1">{uc.Description}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-2xl font-black text-blue-400">{uc.pct}%</p>
+                          <p className="text-[10px] text-gray-500 uppercase font-bold">Match Rate</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {tab === 'duplicates' && (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-3 gap-6">
+                      <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 text-center">
+                        <p className="text-4xl font-black text-red-500">{results.dups.length}</p>
+                        <p className="text-xs font-bold text-gray-500 uppercase mt-2">Duplicate Groups</p>
+                      </div>
+                      <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 text-center">
+                        <p className="text-4xl font-black text-blue-500">{results.duplicatePct.toFixed(1)}%</p>
+                        <p className="text-xs font-bold text-gray-500 uppercase mt-2">Redundancy Rate</p>
+                      </div>
+                      <div className="bg-gray-900 p-6 rounded-2xl border border-gray-800 text-center">
+                        <p className="text-4xl font-black text-green-500">{results.lines.length - results.dups.reduce((a,d)=>a+d.count-1,0)}</p>
+                        <p className="text-xs font-bold text-gray-500 uppercase mt-2">Unique Logs</p>
+                      </div>
+                    </div>
+                    <div className="bg-gray-900 rounded-2xl border border-gray-800 overflow-hidden">
+                      <table className="w-full text-left text-sm">
+                        <thead className="bg-gray-800 text-gray-400 font-bold uppercase text-[10px]">
+                          <tr><th className="px-6 py-4">Log Content Snippet</th><th className="px-6 py-4 text-right">Count</th></tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-800">
+                          {results.dups.slice(0,10).map((d,i) => (
+                            <tr key={i} className="hover:bg-gray-800 transition-colors">
+                              <td className="px-6 py-4 font-mono text-xs text-gray-400 truncate max-w-md">{d.log}</td>
+                              <td className="px-6 py-4 text-right font-bold text-red-400">×{d.count}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {tab === 'storage' && (
+                  <div className="space-y-8">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      {[
+                        { l: 'EPS', v: eps || '0', c: 'text-blue-400' },
+                        { l: 'Events/Day', v: `${(sc.eventsPerDay/1e6).toFixed(1)}M`, c: 'text-purple-400' },
+                        { l: 'Daily GB', v: sc.dailyGB.toFixed(2), c: 'text-pink-400' },
+                        { l: 'Yearly TB', v: (sc.yearlyGB/1024).toFixed(2), c: 'text-yellow-400' }
+                      ].map((x, i) => (
+                        <div key={i} className="bg-gray-900 p-6 rounded-2xl border border-gray-800 text-center">
+                          <p className={`text-3xl font-black ${x.c}`}>{x.v}</p>
+                          <p className="text-[10px] font-bold text-gray-500 uppercase mt-1">{x.l}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="bg-gray-900 p-8 rounded-3xl border border-gray-800 shadow-xl">
+                      <h3 className="text-xl font-bold text-blue-300 mb-6">Splunk 10GB Dev License Status</h3>
+                      <div className="flex justify-between items-end mb-4">
+                        <span className="text-sm font-bold text-gray-400 uppercase">Current Ingestion</span>
+                        <span className={`text-3xl font-black ${sc.exceeded ? 'text-red-500' : 'text-green-500'}`}>{sc.dailyGB.toFixed(2)} <span className="text-sm text-gray-500">/ 10 GB</span></span>
+                      </div>
+                      <div className="w-full bg-gray-800 rounded-full h-6 p-1 border border-gray-700">
+                        <div className={`h-full rounded-full transition-all duration-1000 ${sc.exceeded ? 'bg-red-500' : 'bg-green-500'}`} style={{width:`${sc.pct}%`}}/>
+                      </div>
+                      <p className="mt-6 text-sm text-gray-400 leading-relaxed">
+                        {sc.exceeded 
+                          ? "⚠️ CRITICAL: Your daily log volume exceeds the Splunk Developer License limit. You must implement filtering or upgrade to an Enterprise license to avoid ingestion blocking."
+                          : "✅ HEALTHY: Your current volume is well within the 10GB daily limit. You have approximately " + (10 - sc.dailyGB).toFixed(2) + " GB of headroom remaining."}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {tab === 'report' && (
+                  <div className="bg-gray-900 p-10 rounded-3xl border border-gray-800 font-mono text-sm leading-relaxed custom-scrollbar overflow-y-auto max-h-[70vh]">
+                    <div className="border-b border-gray-800 pb-6 mb-6">
+                      <h2 className="text-2xl font-black text-blue-400 mb-2">LOG QUALITY AUDIT REPORT</h2>
+                      <p className="text-gray-500">Generated on: {new Date().toLocaleString()}</p>
+                    </div>
+                    <div className="space-y-8">
+                      <section>
+                        <h4 className="text-blue-300 font-bold mb-2 underline">1. EXECUTIVE SUMMARY</h4>
+                        <p>Overall Score: {score.total}/100</p>
+                        <p>Status: {score.total >= 80 ? 'PASS' : 'FAIL'}</p>
+                        <p>Log Source Type: {logType}</p>
+                      </section>
+                      <section>
+                        <h4 className="text-blue-300 font-bold mb-2 underline">2. TECHNICAL METRICS</h4>
+                        <p>• Field Coverage: {results.fieldScore.toFixed(1)}%</p>
+                        <p>• Duplicate Rate: {results.duplicatePct.toFixed(1)}%</p>
+                        <p>• Non-Printable: {results.nonPrintablePct.toFixed(1)}%</p>
+                      </section>
+                      <section>
+                        <h4 className="text-blue-300 font-bold mb-2 underline">3. DETECTION COVERAGE</h4>
+                        <p>• Rules Applied: {useCases.length}</p>
+                        <p>• Match Rate: {results.detectionScore.toFixed(1)}%</p>
+                      </section>
+                      <section>
+                        <h4 className="text-blue-300 font-bold mb-2 underline">4. STORAGE PROJECTION</h4>
+                        <p>• Configured EPS: {eps || '0'}</p>
+                        <p>• Daily Volume: {sc.dailyGB.toFixed(2)} GB</p>
+                        <p>• Splunk Dev Compliance: {sc.exceeded ? 'NON-COMPLIANT' : 'COMPLIANT'}</p>
+                      </section>
+                    </div>
+                  </div>
+                )}
+              </main>
+            </div>
+          );
+        };
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
