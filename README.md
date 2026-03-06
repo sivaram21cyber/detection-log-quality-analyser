@@ -9,5 +9,4 @@ Splunk storage sizing.
 - Crucial Field Coverage (Auth, Firewall, Proxy, Endpoint)
 - MITRE ATT&CK Use-Case Matching (UC001–UC006)
 - Duplicate Log Detection
-- Splunk 10GB Dev License Sizing
 
